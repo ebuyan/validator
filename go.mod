@@ -1,4 +1,4 @@
-module github.com/ebuayn/validator
+module github.com/ebuyan/validator
 
 go 1.23
 
