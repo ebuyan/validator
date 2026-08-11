@@ -3,7 +3,6 @@ package validator
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -13,9 +12,11 @@ import (
 	"github.com/gorilla/schema"
 )
 
-var v10 *validator.Validate
-var schemaDecoder = schema.NewDecoder()
-var ValidationMessages = make(map[string]string)
+var (
+	v10                *validator.Validate
+	schemaDecoder      = schema.NewDecoder()
+	validationMessages = make(map[string]string)
+)
 
 type CustomValidator struct {
 	Name    string
@@ -25,11 +26,11 @@ type CustomValidator struct {
 
 func Register(customValidators ...CustomValidator) {
 	v10 = validator.New(validator.WithRequiredStructEnabled())
+	schemaDecoder.IgnoreUnknownKeys(true)
+	validationMessages = make(map[string]string)
 	for _, v := range customValidators {
 		_ = v10.RegisterValidation(v.Name, v.Fn)
-	}
-	for _, v := range customValidators {
-		ValidationMessages[v.Name] = v.Message
+		validationMessages[v.Name] = v.Message
 	}
 }
 
@@ -44,7 +45,6 @@ func BindJSON(object any, r *http.Request) error {
 				return err
 			}
 		}
-		schemaDecoder.IgnoreUnknownKeys(true)
 		if err := schemaDecoder.Decode(object, r.Form); err != nil {
 			return err
 		}
@@ -54,22 +54,14 @@ func BindJSON(object any, r *http.Request) error {
 		}
 	}
 
-	return validate(object)
+	return Validate(object)
 }
 
-func isFormRequest(r *http.Request) bool {
-	return r.Method == http.MethodGet || isMultiPartRequest(r) || isURLEncodedRequest(r)
-}
+func Validate(object any) error {
+	if v10 == nil {
+		return Error{Msg: "validator is not registered: call Register first"}
+	}
 
-func isMultiPartRequest(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data")
-}
-
-func isURLEncodedRequest(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Content-Type"), "urlencoded")
-}
-
-func validate(object any) error {
 	err := v10.Struct(object)
 	if err == nil {
 		return nil
@@ -87,20 +79,21 @@ func validate(object any) error {
 		return nil
 	}
 
+	rootType := reflect.TypeOf(object)
+	if rootType.Kind() == reflect.Ptr {
+		rootType = rootType.Elem()
+	}
+
 	fieldErrors := map[string]string{}
 	for _, fieldErr := range validationErrors {
-		key := buildPath(reflect.TypeOf(object).Elem(), prepareNamespace(fieldErr.Namespace()))
+		key := buildPath(rootType, prepareNamespace(fieldErr.Namespace(), rootType.Name()))
 
-		// Если есть кастомное сообщение — используем его
-		message, ok := ValidationMessages[fieldErr.Tag()]
-		if ok && message != "" {
+		if message := validationMessages[fieldErr.Tag()]; message != "" {
+			// Кастомное сообщение для тега, если зарегистрировано.
 			fieldErrors[key] = message
-			fmt.Printf("Custom message found: key=%s, message=%s\n", key, message)
-
 			continue
 		}
 
-		// Если сообщения нет — формируем стандартный формат
 		fieldErrors[key] = fieldErr.Tag()
 		if fieldErr.Param() != "" {
 			fieldErrors[key] += "=" + fieldErr.Param()
@@ -112,42 +105,155 @@ func validate(object any) error {
 	}
 }
 
-func buildPath(objectType reflect.Type, namespace []string) string {
-	field := namespace[0]
-	if _, err := strconv.Atoi(field); err == nil {
-		if len(namespace) > 1 {
-			return field + "." + buildPath(objectType.Elem(), namespace[1:])
+// ValidateValue валидирует произвольное значение верхнего уровня — структуру,
+// слайс, массив или мапу — по тегам `validate`. v10.Struct (и потому Validate)
+// принимает только структуры, поэтому не-структурные значения заворачиваются в
+// анонимный holder с цепочкой `dive` по числу вложенных уровней — так теги
+// проверяются и на конечных элементах (в т.ч. [][]T, map[K][]T). Пути ошибок
+// формируются тем же buildPath, что и для обычных структур, поэтому ошибки
+// выглядят как "0.field", "0.0.field", "key.field" и т.п. Указатели
+// разыменовываются; nil и скалярные значения — no-op.
+func ValidateValue(value any) error {
+	rv := reflect.ValueOf(value)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return nil
 		}
+		rv = rv.Elem()
+	}
+
+	// Классификация kind, а не enum-диспетчер: прочие виды — no-op через default.
+	//exhaustive:ignore
+	switch rv.Kind() {
+	case reflect.Struct:
+		return Validate(value)
+	case reflect.Slice, reflect.Array, reflect.Map:
+		holderType := reflect.StructOf([]reflect.StructField{{
+			Name: "V",
+			Type: rv.Type(),
+			Tag:  reflect.StructTag(`validate:"` + diveChain(rv.Type()) + `"`),
+		}})
+
+		holder := reflect.New(holderType)
+		holder.Elem().Field(0).Set(rv)
+
+		return Validate(holder.Interface())
+	default:
+		return nil
+	}
+}
+
+// diveChain строит "dive,dive,..." по числу вложенных слайсов/массивов/мап в t,
+// чтобы валидатор дошёл до тегов на конечных элементах.
+func diveChain(t reflect.Type) string {
+	depth := 0
+	for t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map {
+		depth++
+		t = t.Elem()
+	}
+	if depth == 0 {
+		return ""
+	}
+
+	return strings.Repeat("dive,", depth-1) + "dive"
+}
+
+func isFormRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet || isMultiPartRequest(r) || isURLEncodedRequest(r)
+}
+
+func isMultiPartRequest(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data")
+}
+
+func isURLEncodedRequest(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Content-Type"), "urlencoded")
+}
+
+func buildPath(objectType reflect.Type, namespace []string) string {
+	if len(namespace) == 0 {
+		return ""
+	}
+
+	if objectType != nil && objectType.Kind() == reflect.Ptr {
+		objectType = objectType.Elem()
+	}
+
+	field := namespace[0]
+
+	// Индекс слайса/массива или ключ мапы — это не имя поля структуры:
+	// сохраняем токен как есть и спускаемся в тип элемента.
+	_, idxErr := strconv.Atoi(field)
+	isMapKey := objectType != nil && objectType.Kind() == reflect.Map
+	if idxErr == nil || isMapKey {
+		if len(namespace) > 1 {
+			var elem reflect.Type
+			// Elem() валиден только для slice/array/map/ptr/chan — иначе паника.
+			// Если тип рассинхронизирован с namespace, спускаемся с nil (токены
+			// дальше отдадутся как есть).
+			if objectType != nil && isElemable(objectType.Kind()) {
+				elem = objectType.Elem()
+			}
+
+			return field + "." + buildPath(elem, namespace[1:])
+		}
+
 		return field
 	}
 
-	var f reflect.StructField
-	if objectType.Kind() == reflect.Ptr {
-		f, _ = objectType.Elem().FieldByName(field)
-	} else {
-		f, _ = objectType.FieldByName(field)
+	// Тип не структура (или неизвестен) — резолвить имя поля нечем,
+	// отдаём оставшиеся токены как есть, чтобы не паниковать на FieldByName.
+	if objectType == nil || objectType.Kind() != reflect.Struct {
+		return strings.Join(namespace, ".")
 	}
 
+	f, _ := objectType.FieldByName(field)
 	tag := getJSONTag(f.Tag)
 	path := tag
 
 	if len(namespace) > 1 {
-		path += "." + buildPath(f.Type, namespace[1:])
+		rest := buildPath(f.Type, namespace[1:])
+		// У безымянных полей-обёрток (напр. holder с `dive`) json-тег пустой —
+		// не приклеиваем ведущую точку, чтобы путь не начинался с ".".
+		if path == "" {
+			return rest
+		}
+		path += "." + rest
 	}
 
 	return path
 }
 
-func prepareNamespace(namespace string) []string {
-	namespace = strings.SplitN(namespace, ".", 2)[1]
+func prepareNamespace(namespace, rootName string) []string {
+	// Срезаем имя корневой структуры, если оно есть. У анонимной структуры
+	// (rootName == "") validator формирует namespace уже без префикса-имени —
+	// тогда срезать ничего нельзя, иначе потеряется первое реальное поле.
+	if rootName != "" {
+		namespace = strings.TrimPrefix(namespace, rootName)
+		namespace = strings.TrimPrefix(namespace, ".")
+	}
+
 	namespace = strings.ReplaceAll(strings.ReplaceAll(namespace, "[", "."), "]", "")
 
 	return strings.Split(namespace, ".")
+}
+
+// isElemable сообщает, есть ли у типа с таким kind метод-безопасный Elem().
+func isElemable(k reflect.Kind) bool {
+	// Интересуют только контейнерные виды, у которых Elem() валиден.
+	//exhaustive:ignore
+	switch k {
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.Ptr, reflect.Chan:
+		return true
+	default:
+		return false
+	}
 }
 
 func getJSONTag(tag reflect.StructTag) string {
 	if val, ok := tag.Lookup("schema"); ok {
 		return val
 	}
+
 	return strings.Split(tag.Get("json"), ",")[0]
 }

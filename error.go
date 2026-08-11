@@ -20,5 +20,6 @@ func join(errors map[string]string) string {
 	for k, v := range errors {
 		s = append(s, k+"="+v)
 	}
+
 	return strings.Join(s, ";")
 }
